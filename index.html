@@ -1,0 +1,233 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Federal Recruiting Scale — USAJOBS Announcement Data</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.5.1"></script>
+<style>
+:root{
+  --bg:#f4f2ee; --card:#ffffff; --ink:#1c1b1a; --muted:#6e6a64;
+  --accent:#0f4c81; --accent2:#b3552d; --pos:#2e7d32; --neg:#b3552d;
+  --radius:10px; --gap:16px;
+  --serif:Charter,'Bitstream Charter',Cambria,Georgia,serif;
+  --sans:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;
+}
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:var(--bg);color:var(--ink);font-family:var(--sans);
+     font-size:15px;line-height:1.5;padding:24px}
+.wrap{max-width:1100px;margin:0 auto}
+header{margin-bottom:24px;border-bottom:3px solid var(--ink);padding-bottom:16px}
+header h1{font-family:var(--serif);font-size:30px;font-weight:700;
+          letter-spacing:-.01em;margin-bottom:6px}
+header p{color:var(--muted);max-width:70ch}
+.kpis{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));
+      gap:var(--gap);margin-bottom:var(--gap)}
+.kpi{background:var(--card);border-radius:var(--radius);padding:18px 20px;
+     box-shadow:0 1px 3px rgba(0,0,0,.07)}
+.kpi .label{font-size:11px;text-transform:uppercase;letter-spacing:.08em;
+            color:var(--muted);margin-bottom:6px}
+.kpi .value{font-family:var(--serif);font-size:30px;font-weight:700}
+.kpi .sub{font-size:13px;margin-top:4px}
+.sub.neg{color:var(--neg);font-weight:600}
+.sub.pos{color:var(--pos);font-weight:600}
+.grid{display:grid;grid-template-columns:1fr 1fr;gap:var(--gap);
+      margin-bottom:var(--gap)}
+.card{background:var(--card);border-radius:var(--radius);padding:20px 22px;
+      box-shadow:0 1px 3px rgba(0,0,0,.07)}
+.card.full{grid-column:1 / -1}
+.card h3{font-family:var(--serif);font-size:17px;margin-bottom:2px}
+.card .note{font-size:12.5px;color:var(--muted);margin-bottom:14px}
+canvas{max-height:280px}
+table{width:100%;border-collapse:collapse;font-size:13.5px}
+th{text-align:left;padding:8px 10px;border-bottom:2px solid var(--ink);
+   font-size:11.5px;text-transform:uppercase;letter-spacing:.06em;
+   color:var(--muted)}
+td{padding:8px 10px;border-bottom:1px solid #e8e5df}
+td.num{text-align:right;font-variant-numeric:tabular-nums}
+th.num{text-align:right}
+tr:last-child td{border-bottom:none}
+.down{color:var(--neg);font-weight:600}
+footer{margin-top:20px;padding-top:14px;border-top:1px solid #d9d5cd;
+       font-size:12.5px;color:var(--muted)}
+footer b{color:var(--ink)}
+@media(max-width:760px){.grid{grid-template-columns:1fr}}
+@media print{body{background:#fff}.card,.kpi{box-shadow:none;
+  border:1px solid #ddd}}
+</style>
+</head>
+<body>
+<div class="wrap">
+<header>
+  <h1>Is federal recruiting running at replacement scale?</h1>
+  <p>Every USAJOBS announcement, January 2024 – present, from OPM's own
+  Search and HistoricJoa APIs. Counts are <b>announcements</b>, not hires or
+  positions: postings can be cancelled or cover many vacancies, and
+  direct-hire / excepted activity that bypasses USAJOBS is not visible here.
+  Test records and open-continuous placeholder counts are excluded.</p>
+</header>
+
+<section class="kpis" id="kpis"></section>
+
+<div class="grid">
+  <div class="card full">
+    <h3>Monthly announcement volume, with excepted-service overlay</h3>
+    <div class="note">The 2025 freeze collapse is visible in competitive
+    hiring; excepted-service announcements fell far less, so their share of
+    the (shrunken) total rose sharply.</div>
+    <canvas id="cMonthly"></canvas>
+  </div>
+  <div class="card">
+    <h3>Early-career (Pathways) announcements</h3>
+    <div class="note">Announcements open to Students / Recent graduates —
+    the merit-based early-career channel.</div>
+    <canvas id="cPathways"></canvas>
+  </div>
+  <div class="card">
+    <h3>Entry-grade share of GS announcements</h3>
+    <div class="note">Share of GS announcements with a grade floor of
+    GS-9 or below.</div>
+    <canvas id="cEntry"></canvas>
+  </div>
+  <div class="card">
+    <h3>Jan–Aug, year over year</h3>
+    <div class="note">Same eight months each year, so seasonality can't
+    explain the gap.</div>
+    <table id="tVerdict"></table>
+  </div>
+  <div class="card">
+    <h3>Posted since June 2026 in Partnership-flagged series</h3>
+    <div class="note">Recruiting activity after the Partnership analysis
+    cutoff, in the four series it flagged (cells of 3+ shown).</div>
+    <table id="tCutoff"></table>
+  </div>
+  <div class="card full">
+    <h3>Advertised grade floors, 2024 → 2026</h3>
+    <div class="note">Mean advertised minimum GS grade by occupational
+    series (series with 50+ announcements in both years). Largest declines
+    shown; the median and down-share cover the full distribution.</div>
+    <table id="tDrift"></table>
+  </div>
+</div>
+
+<footer id="foot"></footer>
+</div>
+
+<script>
+const D = {"quarterly": [{"q": "2024-Q1", "n": 102150}, {"q": "2024-Q2", "n": 84777}, {"q": "2024-Q3", "n": 89667}, {"q": "2024-Q4", "n": 89218}, {"q": "2025-Q1", "n": 51880}, {"q": "2025-Q2", "n": 32635}, {"q": "2025-Q3", "n": 44463}, {"q": "2025-Q4", "n": 39109}, {"q": "2026-Q1", "n": 58064}, {"q": "2026-Q2", "n": 67654}, {"q": "2026-Q3", "n": 46614}], "monthly": [{"m": "2024-01", "n": 35931, "exc": 9686}, {"m": "2024-02", "n": 34058, "exc": 8548}, {"m": "2024-03", "n": 32161, "exc": 7316}, {"m": "2024-04", "n": 30934, "exc": 6752}, {"m": "2024-05", "n": 27870, "exc": 5906}, {"m": "2024-06", "n": 25973, "exc": 5688}, {"m": "2024-07", "n": 29810, "exc": 6662}, {"m": "2024-08", "n": 31456, "exc": 7398}, {"m": "2024-09", "n": 28401, "exc": 7077}, {"m": "2024-10", "n": 31735, "exc": 8324}, {"m": "2024-11", "n": 28578, "exc": 7414}, {"m": "2024-12", "n": 28905, "exc": 7123}, {"m": "2025-01", "n": 23845, "exc": 6591}, {"m": "2025-02", "n": 18913, "exc": 6233}, {"m": "2025-03", "n": 9122, "exc": 4595}, {"m": "2025-04", "n": 10609, "exc": 4657}, {"m": "2025-05", "n": 10470, "exc": 4217}, {"m": "2025-06", "n": 11556, "exc": 4958}, {"m": "2025-07", "n": 14722, "exc": 6070}, {"m": "2025-08", "n": 15617, "exc": 6081}, {"m": "2025-09", "n": 14124, "exc": 5346}, {"m": "2025-10", "n": 13869, "exc": 6787}, {"m": "2025-11", "n": 11483, "exc": 4826}, {"m": "2025-12", "n": 13757, "exc": 5028}, {"m": "2026-01", "n": 16122, "exc": 5505}, {"m": "2026-02", "n": 18824, "exc": 6450}, {"m": "2026-03", "n": 23118, "exc": 7396}, {"m": "2026-04", "n": 23832, "exc": 7767}, {"m": "2026-05", "n": 21888, "exc": 7705}, {"m": "2026-06", "n": 21934, "exc": 7621}, {"m": "2026-07", "n": 22560, "exc": 7269}, {"m": "2026-08", "n": 23670, "exc": 7417}, {"m": "2026-09", "n": 384, "exc": 108}], "pathways": [{"q": "2024-Q1", "n": 102150, "ec": 1642}, {"q": "2024-Q2", "n": 84777, "ec": 1128}, {"q": "2024-Q3", "n": 89667, "ec": 1041}, {"q": "2024-Q4", "n": 89218, "ec": 1104}, {"q": "2025-Q1", "n": 51880, "ec": 436}, {"q": "2025-Q2", "n": 32635, "ec": 149}, {"q": "2025-Q3", "n": 44463, "ec": 269}, {"q": "2025-Q4", "n": 39109, "ec": 245}, {"q": "2026-Q1", "n": 58064, "ec": 398}, {"q": "2026-Q2", "n": 67654, "ec": 837}, {"q": "2026-Q3", "n": 46614, "ec": 482}], "entry": [{"q": "2024-Q1", "n": 70497, "eg": 30770}, {"q": "2024-Q2", "n": 57222, "eg": 23164}, {"q": "2024-Q3", "n": 60357, "eg": 24838}, {"q": "2024-Q4", "n": 60079, "eg": 25127}, {"q": "2025-Q1", "n": 31400, "eg": 14242}, {"q": "2025-Q2", "n": 16678, "eg": 8529}, {"q": "2025-Q3", "n": 25245, "eg": 12375}, {"q": "2025-Q4", "n": 21434, "eg": 10885}, {"q": "2026-Q1", "n": 34256, "eg": 15636}, {"q": "2026-Q2", "n": 41575, "eg": 17993}, {"q": "2026-Q3", "n": 28728, "eg": 12140}], "verdict": [{"yr": "2024", "n": 248193, "ec": 3415, "eg": 70926}, {"yr": "2025", "n": 114854, "ec": 727, "eg": 31268}, {"yr": "2026", "n": 171948, "ec": 1692, "eg": 45682}], "postcutoff": [{"series": "1862", "label": "Consumer Safety Inspection", "dept": "AG", "n": 106}, {"series": "1811", "label": "Criminal Investigation", "dept": "DJ", "n": 98}, {"series": "1811", "label": "Criminal Investigation", "dept": "HS", "n": 43}, {"series": "1811", "label": "Criminal Investigation", "dept": "PO", "n": 36}, {"series": "1811", "label": "Criminal Investigation", "dept": "IN", "n": 22}, {"series": "0962", "label": "Contact Representative", "dept": "DD", "n": 21}, {"series": "1811", "label": "Criminal Investigation", "dept": "VA", "n": 20}, {"series": "0962", "label": "Contact Representative", "dept": "VA", "n": 17}, {"series": "0962", "label": "Contact Representative", "dept": "TR", "n": 16}, {"series": "1811", "label": "Criminal Investigation", "dept": "CM", "n": 16}, {"series": "1811", "label": "Criminal Investigation", "dept": "TR", "n": 16}, {"series": "1811", "label": "Criminal Investigation", "dept": "SB", "n": 14}, {"series": "1340", "label": "Meteorology", "dept": "CM", "n": 13}, {"series": "0962", "label": "Contact Representative", "dept": "IN", "n": 11}, {"series": "1811", "label": "Criminal Investigation", "dept": "AG", "n": 11}], "postcutoff_total": 586, "drift_top": [{"s": "0099", "n24": 175, "n26": 93, "g24": 3.19, "g26": 0.57, "d": -2.62}, {"s": "0601", "n24": 2300, "n26": 916, "g24": 11.86, "g26": 10.92, "d": -0.94}, {"s": "0858", "n24": 186, "n26": 103, "g24": 11.08, "g26": 10.2, "d": -0.88}, {"s": "0901", "n24": 648, "n26": 525, "g24": 9.54, "g26": 8.77, "d": -0.77}, {"s": "0962", "n24": 614, "n26": 202, "g24": 7.16, "g26": 6.42, "d": -0.74}, {"s": "0181", "n24": 126, "n26": 81, "g24": 7.48, "g26": 6.88, "d": -0.6}, {"s": "0861", "n24": 300, "n26": 99, "g24": 13.16, "g26": 12.57, "d": -0.59}, {"s": "2010", "n24": 965, "n26": 505, "g24": 9.47, "g26": 8.89, "d": -0.58}, {"s": "0950", "n24": 967, "n26": 651, "g24": 10.19, "g26": 9.63, "d": -0.56}, {"s": "1712", "n24": 1919, "n26": 742, "g24": 10.64, "g26": 10.09, "d": -0.55}, {"s": "1550", "n24": 299, "n26": 101, "g24": 12.45, "g26": 11.94, "d": -0.51}, {"s": "0028", "n24": 1086, "n26": 337, "g24": 11.6, "g26": 11.15, "d": -0.45}], "drift_median": 0.1, "drift_down_share": 35.6, "coverage": {"min": "2024-01-01", "max": "2026-09-01", "n": 706608, "built": "2026-09-01"}};
+const fmt = n => n.toLocaleString();
+const INK='#1c1b1a', BLUE='#0f4c81', RUST='#b3552d', MUT='#6e6a64';
+
+/* ---------- KPIs ---------- */
+(function(){
+  const v = {}; D.verdict.forEach(r => v[r.yr] = r);
+  const cards = [];
+  if (v['2024'] && v['2026']) {
+    const pct = ((v['2026'].n - v['2024'].n) / v['2024'].n * 100).toFixed(0);
+    cards.push({label:'Jan–Aug announcements, 2026', value:fmt(v['2026'].n),
+      sub:`${pct}% vs 2024 (${fmt(v['2024'].n)})`, cls:pct<0?'neg':'pos'});
+    const ep = ((v['2026'].ec - v['2024'].ec) / v['2024'].ec * 100).toFixed(0);
+    cards.push({label:'Early-career (Pathways), 2026', value:fmt(v['2026'].ec),
+      sub:`${ep}% vs 2024 (${fmt(v['2024'].ec)})`, cls:ep<0?'neg':'pos'});
+  }
+  if (v['2025'] && v['2024']) {
+    const p5 = ((v['2025'].n - v['2024'].n) / v['2024'].n * 100).toFixed(0);
+    cards.push({label:'2025 freeze-year drop', value:p5+'%',
+      sub:`Jan–Aug: ${fmt(v['2025'].n)} announcements`, cls:'neg'});
+  }
+  cards.push({label:'Flagged-series postings since Jun 2026',
+    value:fmt(D.postcutoff_total),
+    sub:'after the Partnership analysis cutoff', cls:''});
+  if (D.drift_median !== null) {
+    cards.push({label:'Median grade-floor drift \u201924\u2192\u201926',
+      value:(D.drift_median>0?'+':'')+D.drift_median,
+      sub:`${D.drift_down_share}% of series advertise lower`,
+      cls:D.drift_median<0?'neg':''});
+  }
+  document.getElementById('kpis').innerHTML = cards.map(c =>
+    `<div class="kpi"><div class="label">${c.label}</div>
+     <div class="value">${c.value}</div>
+     <div class="sub ${c.cls}">${c.sub}</div></div>`).join('');
+})();
+
+/* ---------- monthly volume + excepted overlay ---------- */
+new Chart(document.getElementById('cMonthly'), {
+  data: {
+    labels: D.monthly.map(r => r.m),
+    datasets: [
+      {type:'bar', label:'All announcements',
+       data:D.monthly.map(r=>r.n), backgroundColor:BLUE+'55',
+       borderColor:BLUE, borderWidth:1},
+      {type:'line', label:'Excepted service',
+       data:D.monthly.map(r=>r.exc), borderColor:RUST,
+       backgroundColor:RUST, borderWidth:2, pointRadius:0, tension:.25}
+    ]
+  },
+  options:{responsive:true, animation:false,
+    interaction:{mode:'index', intersect:false},
+    plugins:{legend:{labels:{boxWidth:14}}},
+    scales:{y:{beginAtZero:true}, x:{ticks:{maxTicksLimit:16}}}}
+});
+
+/* ---------- pathways ---------- */
+new Chart(document.getElementById('cPathways'), {
+  type:'bar',
+  data:{labels:D.pathways.map(r=>r.q),
+    datasets:[{label:'Student/Recent-grad announcements',
+      data:D.pathways.map(r=>r.ec), backgroundColor:RUST+'99',
+      borderColor:RUST, borderWidth:1}]},
+  options:{responsive:true, animation:false,
+    plugins:{legend:{display:false}},
+    scales:{y:{beginAtZero:true}}}
+});
+
+/* ---------- entry-grade share ---------- */
+new Chart(document.getElementById('cEntry'), {
+  type:'line',
+  data:{labels:D.entry.map(r=>r.q),
+    datasets:[{label:'GS-9-or-below floor, % of GS announcements',
+      data:D.entry.map(r=>(100*r.eg/r.n).toFixed(1)),
+      borderColor:BLUE, backgroundColor:BLUE+'22', fill:true,
+      borderWidth:2, tension:.25}]},
+  options:{responsive:true, animation:false,
+    plugins:{legend:{display:false}},
+    scales:{y:{ticks:{callback:v=>v+'%'}}}}
+});
+
+/* ---------- verdict table ---------- */
+document.getElementById('tVerdict').innerHTML =
+  `<tr><th>Year</th><th class="num">Announcements</th>
+   <th class="num">Pathways</th><th class="num">Entry-grade GS</th></tr>` +
+  D.verdict.map(r =>
+    `<tr><td>${r.yr}</td><td class="num">${fmt(r.n)}</td>
+     <td class="num">${fmt(r.ec)}</td><td class="num">${fmt(r.eg)}</td></tr>`
+  ).join('');
+
+/* ---------- post-cutoff table ---------- */
+document.getElementById('tCutoff').innerHTML =
+  `<tr><th>Series</th><th>Dept</th><th class="num">Announcements</th></tr>` +
+  D.postcutoff.map(r =>
+    `<tr><td>${r.label} (${r.series})</td><td>${r.dept}</td>
+     <td class="num">${fmt(r.n)}</td></tr>`).join('');
+
+/* ---------- drift table ---------- */
+document.getElementById('tDrift').innerHTML =
+  `<tr><th>Series</th><th class="num">n 2024</th><th class="num">n 2026</th>
+   <th class="num">Avg floor 2024</th><th class="num">Avg floor 2026</th>
+   <th class="num">Drift</th></tr>` +
+  D.drift_top.map(r =>
+    `<tr><td>${r.s}</td><td class="num">${fmt(r.n24)}</td>
+     <td class="num">${fmt(r.n26)}</td><td class="num">${r.g24}</td>
+     <td class="num">${r.g26}</td>
+     <td class="num ${r.d<0?'down':''}">${r.d>0?'+':''}${r.d}</td></tr>`
+  ).join('');
+
+/* ---------- footer ---------- */
+document.getElementById('foot').innerHTML =
+  `<b>Sources:</b> USAJOBS Search API + HistoricJoa archive (OPM). ` +
+  `Coverage ${D.coverage.min} – ${D.coverage.max}, ` +
+  `${fmt(D.coverage.n)} announcements. Built ${D.coverage.built}. ` +
+  `Announcements ≠ hires; excludes activity that bypasses USAJOBS.`;
+</script>
+</body>
+</html>

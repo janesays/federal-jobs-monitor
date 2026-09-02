@@ -19,8 +19,18 @@ import sqlite3
 import statistics as stats
 from collections import defaultdict
 
-# Departments are auto-detected from the data (top N by announcement volume).
-# Override with --depts CODE1 CODE2 ... if you want a specific set.
+# Departments shown on the dashboard: code -> short display name.
+# Codes are OPM top-level org codes as used by USAJOBS OrganizationCodes.
+TRACKED = {
+    "VA": "Veterans Affairs",
+    "DD": "Defense (civilian)",
+    "HS": "Homeland Security",
+    "HE": "Health & Human Services",
+    "TR": "Treasury / IRS",
+    "IN": "Interior",
+    "EP": "Environmental Protection",
+    "SZ": "Social Security Admin.",
+}
 
 BASELINE_END = "2025-02-01"   # baseline = weekly mean before this date
 DRP_CUTOFF = "2025-10-01"     # backfill window start (DRP separations effective)
@@ -29,46 +39,11 @@ PUBLIC_PATHS = {"public"}
 VET_PATHS = {"vet", "disability", "mspouse", "nguard", "special-authorities"}
 
 
-def detect_departments(con, top_n=8, only=None):
-    """Return {code: display_name} for the biggest departments in the data.
-    Falls back to grouping by department_name if codes are empty."""
-    rows = con.execute(
-        """
-        SELECT department_code, MAX(department_name) AS name, COUNT(*) AS n FROM (
-            SELECT department_code, department_name FROM historic
-            WHERE department_code != ''
-            UNION ALL
-            SELECT department_code, department_name FROM postings
-            WHERE department_code != ''
-        ) GROUP BY department_code ORDER BY n DESC
-        """
-    ).fetchall()
-    if not rows:  # codes empty everywhere: key on names instead
-        rows = con.execute(
-            """
-            SELECT department_name, department_name, COUNT(*) AS n FROM (
-                SELECT department_name FROM historic WHERE department_name != ''
-                UNION ALL
-                SELECT department_name FROM postings WHERE department_name != ''
-            ) GROUP BY department_name ORDER BY n DESC
-            """
-        ).fetchall()
-    out = {}
-    for code, name, n in rows:
-        if only and code not in only:
-            continue
-        disp = (name or code or "?").replace("Department of the ", "").replace("Department of ", "")
-        out[code] = disp[:32]
-        if len(out) >= (len(only) if only else top_n):
-            break
-    return out
-
-
 def week_floor(d: dt.date) -> str:
     return (d - dt.timedelta(days=d.weekday())).isoformat()  # Monday of week
 
 
-def load_weekly(con, weeks_back, tracked):
+def load_weekly(con, weeks_back):
     """dept -> {week_monday: count}, using historic + recent live postings."""
     end = dt.date.today()
     start = end - dt.timedelta(weeks=weeks_back)
@@ -77,13 +52,13 @@ def load_weekly(con, weeks_back, tracked):
         SELECT department_code, open_date FROM historic
         WHERE open_date >= ? AND department_code != ''
         UNION ALL
-        SELECT department_code, open_date FROM postings
-        WHERE open_date >= ? AND department_code != ''
+        SELECT department_code, first_seen FROM postings
+        WHERE first_seen >= ? AND department_code != ''
           AND control_number NOT IN (SELECT control_number FROM historic)
     """
     s = start.isoformat()
     for dept, day in con.execute(q, (s, s)):
-        if dept not in tracked or not day:
+        if dept not in TRACKED or not day:
             continue
         try:
             wk = week_floor(dt.date.fromisoformat(day[:10]))
@@ -101,42 +76,37 @@ def load_weekly(con, weeks_back, tracked):
 
 
 def hiring_path_quarters(con):
-    """Quarterly composition of hiring paths, from historic + live postings.
-    Rows with no recorded paths are excluded from percentages rather than
-    silently counted as 'other'."""
+    """Quarterly composition of hiring paths from historic announcements."""
     rows = con.execute(
-        "SELECT open_date, hiring_paths FROM historic WHERE open_date >= '2024-07-01' "
-        "UNION ALL "
-        "SELECT open_date, hiring_paths FROM postings WHERE open_date >= '2024-07-01' "
-        "AND control_number NOT IN (SELECT control_number FROM historic)"
+        "SELECT open_date, hiring_paths FROM historic WHERE open_date >= '2024-07-01'"
     ).fetchall()
     agg = defaultdict(lambda: defaultdict(int))
     for day, paths in rows:
-        if not day or not paths:
+        if not day:
             continue
         d = dt.date.fromisoformat(day[:10])
         fy = d.year + (1 if d.month >= 10 else 0)
         q = ((d.month - 10) % 12) // 3 + 1
         key = (fy, q, f"FY{str(fy)[2:]} Q{q}")
-        ps = set(p.strip().lower() for p in paths.split(","))
+        ps = set((paths or "").split(","))
         if ps & PUBLIC_PATHS:
             agg[key]["public"] += 1
         elif ps & VET_PATHS:
             agg[key]["vets"] += 1
-        else:
+        elif paths:
             agg[key]["internal"] += 1
+        else:
+            agg[key]["other"] += 1
     out = []
     for key in sorted(agg)[-8:]:
         c = agg[key]
         tot = sum(c.values()) or 1
-        if tot < 50:
-            continue  # too thin to chart honestly
         out.append({
             "q": key[2],
             "public": round(100 * c["public"] / tot),
             "internal": round(100 * c["internal"] / tot),
             "vets": round(100 * c["vets"] / tot),
-            "other": 0,
+            "other": round(100 * c["other"] / tot),
         })
     return out
 
@@ -194,10 +164,7 @@ def load_drp(path):
     try:
         with open(path, newline="") as f:
             for row in csv.DictReader(f):
-                raw = (row.get("drp_separations") or "").replace(",", "").strip()
-                if not raw.isdigit():
-                    continue  # blank or non-numeric: not filled in yet — skip
-                out[row["dept_code"].strip()] = {"seps": int(raw)}
+                out[row["dept_code"].strip()] = {"seps": int(row["drp_separations"])}
     except FileNotFoundError:
         print(f"  note: {path} not found; backfill panel will be empty")
     return out
@@ -209,33 +176,14 @@ def main():
     ap.add_argument("--out", default="monitor_data.json")
     ap.add_argument("--drp", default="drp_separations.csv")
     ap.add_argument("--weeks", type=int, default=104)
-    ap.add_argument("--top", type=int, default=8, help="number of departments to auto-track")
-    ap.add_argument("--depts", nargs="*", help="explicit department codes to track")
     args = ap.parse_args()
 
     con = sqlite3.connect(args.db)
-
-    # diagnostics first — so an empty result explains itself
-    nh = con.execute("SELECT COUNT(*) FROM historic").fetchone()[0]
-    np_ = con.execute("SELECT COUNT(*) FROM postings").fetchone()[0] \
-        if con.execute("SELECT name FROM sqlite_master WHERE name='postings'").fetchone() else 0
-    print(f"db: {nh} historic rows, {np_} snapshot rows")
-    if nh + np_ == 0:
-        raise SystemExit("Database is empty — run backfill.py / snapshot.py first.")
-
-    tracked = detect_departments(con, top_n=args.top, only=args.depts)
-    print("tracking departments:")
-    for c, n in tracked.items():
-        print(f"  {c or '(no code)':<8} {n}")
-
-    axis, counts = load_weekly(con, args.weeks, tracked)
+    axis, counts = load_weekly(con, args.weeks)
 
     agencies = {}
-    for code, name in tracked.items():
+    for code, name in TRACKED.items():
         series = [counts[code].get(w, 0) for w in axis]
-        if not any(series):
-            print(f"  warning: no weekly data matched {code} — dropping")
-            continue
         pre = [v for w, v in zip(axis, series) if w < BASELINE_END and v > 0]
         sample = pre if len(pre) >= 8 else [v for v in series if v > 0] or [1]
         base = stats.mean(sample)

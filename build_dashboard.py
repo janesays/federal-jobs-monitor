@@ -1,4 +1,194 @@
-<!DOCTYPE html>
+#!/usr/bin/env python3
+"""
+build_dashboard.py
+Queries monitor.db and writes index.html — a self-contained,
+shareable dashboard for the federal recruiting-scale analysis.
+
+Usage (from the pipeline folder):
+    python3 build_dashboard.py
+    open index.html
+
+Hygiene rules applied to all aggregates:
+  * QA/test records excluded (title contains 'test', dept AM/OM)
+  * total_openings >= 9999 treated as open-continuous placeholder
+    (openings sums are NOT shown anywhere; announcement counts only)
+"""
+import json
+import sqlite3
+import sys
+from datetime import date
+
+DB = "monitor.db"
+OUT = "index.html"
+
+DRP_SERIES = {
+    "1811": "Criminal Investigation",
+    "1340": "Meteorology",
+    "0962": "Contact Representative",
+    "1862": "Consumer Safety Inspection",
+}
+
+HYGIENE = ("(lower(title) NOT LIKE '%test%' "
+           " OR department_code NOT IN ('AM','OM'))")
+
+
+def q(con, sql, params=()):
+    return con.execute(sql, params).fetchall()
+
+
+def main():
+    con = sqlite3.connect(DB)
+    try:
+        con.execute("SELECT 1 FROM historic LIMIT 1")
+    except sqlite3.OperationalError:
+        sys.exit("No 'historic' table here — run from the pipeline folder.")
+
+    data = {}
+
+    # ---- quarterly throughput, government-wide ----
+    rows = q(con, f"""
+        SELECT substr(open_date,1,4) || '-Q' ||
+               ((CAST(substr(open_date,6,2) AS INTEGER)+2)/3) AS qtr,
+               COUNT(*)
+        FROM historic
+        WHERE open_date >= '2024-01-01' AND {HYGIENE}
+        GROUP BY qtr ORDER BY qtr""")
+    data["quarterly"] = [{"q": r[0], "n": r[1]} for r in rows]
+
+    # ---- monthly volume + excepted share (freeze curve) ----
+    rows = q(con, f"""
+        SELECT substr(open_date,1,7) AS m, COUNT(*),
+               SUM(CASE WHEN service_type LIKE 'Excepted%' THEN 1 ELSE 0 END)
+        FROM historic
+        WHERE open_date >= '2024-01-01' AND {HYGIENE}
+        GROUP BY m ORDER BY m""")
+    data["monthly"] = [{"m": r[0], "n": r[1], "exc": r[2]} for r in rows]
+
+    # ---- Pathways (early-career) share by quarter ----
+    rows = q(con, f"""
+        SELECT substr(open_date,1,4) || '-Q' ||
+               ((CAST(substr(open_date,6,2) AS INTEGER)+2)/3) AS qtr,
+               COUNT(*),
+               SUM(CASE WHEN lower(hiring_paths) LIKE '%student%'
+                          OR lower(hiring_paths) LIKE '%graduate%'
+                        THEN 1 ELSE 0 END)
+        FROM historic
+        WHERE open_date >= '2024-01-01' AND {HYGIENE}
+        GROUP BY qtr ORDER BY qtr""")
+    data["pathways"] = [{"q": r[0], "n": r[1], "ec": r[2]} for r in rows]
+
+    # ---- entry-grade share by quarter (GS floor <= 9) ----
+    rows = q(con, f"""
+        SELECT substr(open_date,1,4) || '-Q' ||
+               ((CAST(substr(open_date,6,2) AS INTEGER)+2)/3) AS qtr,
+               COUNT(*),
+               SUM(CASE WHEN CAST(grade_low AS INTEGER) <= 9
+                        THEN 1 ELSE 0 END)
+        FROM historic
+        WHERE pay_plan='GS' AND grade_low GLOB '[0-9]*'
+          AND open_date >= '2024-01-01' AND {HYGIENE}
+        GROUP BY qtr ORDER BY qtr""")
+    data["entry"] = [{"q": r[0], "n": r[1], "eg": r[2]} for r in rows]
+
+    # ---- Jan–Aug verdict table ----
+    rows = q(con, f"""
+        SELECT substr(open_date,1,4) AS yr, COUNT(*),
+               SUM(CASE WHEN lower(hiring_paths) LIKE '%student%'
+                          OR lower(hiring_paths) LIKE '%graduate%'
+                        THEN 1 ELSE 0 END),
+               SUM(CASE WHEN pay_plan='GS' AND grade_low GLOB '[0-9]*'
+                         AND CAST(grade_low AS INTEGER) <= 9
+                        THEN 1 ELSE 0 END)
+        FROM historic
+        WHERE substr(open_date,6,5) BETWEEN '01-01' AND '08-31'
+          AND open_date >= '2024-01-01' AND {HYGIENE}
+        GROUP BY yr ORDER BY yr""")
+    data["verdict"] = [{"yr": r[0], "n": r[1], "ec": r[2], "eg": r[3]}
+                       for r in rows]
+
+    # ---- post-cutoff recruiting in Partnership-flagged series ----
+    ph = ",".join("?" * len(DRP_SERIES))
+    rows = q(con, f"""
+        SELECT substr(series,1,4) AS s4, department_code, COUNT(*)
+        FROM historic
+        WHERE open_date >= '2026-06-01'
+          AND substr(series,1,4) IN ({ph}) AND {HYGIENE}
+        GROUP BY s4, department_code
+        HAVING COUNT(*) >= 3
+        ORDER BY COUNT(*) DESC LIMIT 15""", tuple(DRP_SERIES))
+    data["postcutoff"] = [
+        {"series": r[0], "label": DRP_SERIES[r[0]], "dept": r[1] or "?",
+         "n": r[2]} for r in rows]
+    row = q(con, f"""
+        SELECT COUNT(*) FROM historic
+        WHERE open_date >= '2026-06-01'
+          AND substr(series,1,4) IN ({ph}) AND {HYGIENE}""",
+        tuple(DRP_SERIES))
+    data["postcutoff_total"] = row[0][0]
+
+    # ---- grade drift 2024 vs 2026, full distribution ----
+    rows = q(con, f"""
+        WITH g AS (
+          SELECT substr(series,1,4) AS s4, substr(open_date,1,4) AS yr,
+                 CAST(grade_low AS REAL) AS glo
+          FROM historic
+          WHERE pay_plan='GS' AND grade_low GLOB '[0-9]*' AND {HYGIENE}
+        )
+        SELECT s4,
+               COUNT(CASE WHEN yr='2024' THEN 1 END) AS n24,
+               COUNT(CASE WHEN yr='2026' THEN 1 END) AS n26,
+               ROUND(AVG(CASE WHEN yr='2024' THEN glo END),2),
+               ROUND(AVG(CASE WHEN yr='2026' THEN glo END),2)
+        FROM g GROUP BY s4
+        HAVING n24 >= 50 AND n26 >= 50""")
+    drift = [{"s": r[0], "n24": r[1], "n26": r[2], "g24": r[3], "g26": r[4],
+              "d": round(r[4] - r[3], 2)} for r in rows]
+    drift.sort(key=lambda x: x["d"])
+    data["drift_top"] = drift[:12]
+    if drift:
+        ds = sorted(x["d"] for x in drift)
+        data["drift_median"] = ds[len(ds) // 2]
+        data["drift_down_share"] = round(
+            100.0 * sum(1 for x in drift if x["d"] < 0) / len(drift), 1)
+    else:
+        data["drift_median"] = None
+        data["drift_down_share"] = None
+
+    # ---- agency breakdown: Jan–Aug 2024 vs 2026, DoD grouped ----
+    rows = q(con, f"""
+        SELECT CASE WHEN department_code IN ('AR','NV','AF','DD')
+                    THEN 'DOD' ELSE department_code END AS dept,
+               SUM(CASE WHEN substr(open_date,1,4)='2024' THEN 1 ELSE 0 END),
+               SUM(CASE WHEN substr(open_date,1,4)='2026' THEN 1 ELSE 0 END)
+        FROM historic
+        WHERE substr(open_date,6,5) BETWEEN '01-01' AND '08-31'
+          AND open_date >= '2024-01-01'
+          AND department_code IS NOT NULL AND department_code != ''
+          AND {HYGIENE}
+        GROUP BY dept
+        HAVING SUM(CASE WHEN substr(open_date,1,4)='2024' THEN 1 ELSE 0 END)
+               >= 200
+        ORDER BY 3 DESC LIMIT 18""")
+    data["agencies"] = [
+        {"dept": r[0], "n24": r[1], "n26": r[2],
+         "pct": round(100.0 * (r[2] - r[1]) / r[1], 1) if r[1] else None}
+        for r in rows]
+
+    # ---- coverage footer ----
+    row = q(con, "SELECT MIN(open_date), MAX(open_date), COUNT(*) "
+                 "FROM historic")[0]
+    data["coverage"] = {"min": row[0], "max": row[1], "n": row[2],
+                        "built": date.today().isoformat()}
+
+    con.close()
+
+    html = TEMPLATE.replace("__DATA__", json.dumps(data))
+    with open(OUT, "w") as f:
+        f.write(html)
+    print(f"wrote {OUT}  (open it with:  open {OUT})")
+
+
+TEMPLATE = r"""<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
@@ -121,7 +311,7 @@ footer b{color:var(--ink)}
 </div>
 
 <script>
-const D = {"quarterly": [{"q": "2024-Q1", "n": 102150}, {"q": "2024-Q2", "n": 84777}, {"q": "2024-Q3", "n": 89667}, {"q": "2024-Q4", "n": 89218}, {"q": "2025-Q1", "n": 51880}, {"q": "2025-Q2", "n": 32635}, {"q": "2025-Q3", "n": 44463}, {"q": "2025-Q4", "n": 39109}, {"q": "2026-Q1", "n": 58064}, {"q": "2026-Q2", "n": 67654}, {"q": "2026-Q3", "n": 46614}], "monthly": [{"m": "2024-01", "n": 35931, "exc": 9686}, {"m": "2024-02", "n": 34058, "exc": 8548}, {"m": "2024-03", "n": 32161, "exc": 7316}, {"m": "2024-04", "n": 30934, "exc": 6752}, {"m": "2024-05", "n": 27870, "exc": 5906}, {"m": "2024-06", "n": 25973, "exc": 5688}, {"m": "2024-07", "n": 29810, "exc": 6662}, {"m": "2024-08", "n": 31456, "exc": 7398}, {"m": "2024-09", "n": 28401, "exc": 7077}, {"m": "2024-10", "n": 31735, "exc": 8324}, {"m": "2024-11", "n": 28578, "exc": 7414}, {"m": "2024-12", "n": 28905, "exc": 7123}, {"m": "2025-01", "n": 23845, "exc": 6591}, {"m": "2025-02", "n": 18913, "exc": 6233}, {"m": "2025-03", "n": 9122, "exc": 4595}, {"m": "2025-04", "n": 10609, "exc": 4657}, {"m": "2025-05", "n": 10470, "exc": 4217}, {"m": "2025-06", "n": 11556, "exc": 4958}, {"m": "2025-07", "n": 14722, "exc": 6070}, {"m": "2025-08", "n": 15617, "exc": 6081}, {"m": "2025-09", "n": 14124, "exc": 5346}, {"m": "2025-10", "n": 13869, "exc": 6787}, {"m": "2025-11", "n": 11483, "exc": 4826}, {"m": "2025-12", "n": 13757, "exc": 5028}, {"m": "2026-01", "n": 16122, "exc": 5505}, {"m": "2026-02", "n": 18824, "exc": 6450}, {"m": "2026-03", "n": 23118, "exc": 7396}, {"m": "2026-04", "n": 23832, "exc": 7767}, {"m": "2026-05", "n": 21888, "exc": 7705}, {"m": "2026-06", "n": 21934, "exc": 7621}, {"m": "2026-07", "n": 22560, "exc": 7269}, {"m": "2026-08", "n": 23670, "exc": 7417}, {"m": "2026-09", "n": 384, "exc": 108}], "pathways": [{"q": "2024-Q1", "n": 102150, "ec": 1642}, {"q": "2024-Q2", "n": 84777, "ec": 1128}, {"q": "2024-Q3", "n": 89667, "ec": 1041}, {"q": "2024-Q4", "n": 89218, "ec": 1104}, {"q": "2025-Q1", "n": 51880, "ec": 436}, {"q": "2025-Q2", "n": 32635, "ec": 149}, {"q": "2025-Q3", "n": 44463, "ec": 269}, {"q": "2025-Q4", "n": 39109, "ec": 245}, {"q": "2026-Q1", "n": 58064, "ec": 398}, {"q": "2026-Q2", "n": 67654, "ec": 837}, {"q": "2026-Q3", "n": 46614, "ec": 482}], "entry": [{"q": "2024-Q1", "n": 70497, "eg": 30770}, {"q": "2024-Q2", "n": 57222, "eg": 23164}, {"q": "2024-Q3", "n": 60357, "eg": 24838}, {"q": "2024-Q4", "n": 60079, "eg": 25127}, {"q": "2025-Q1", "n": 31400, "eg": 14242}, {"q": "2025-Q2", "n": 16678, "eg": 8529}, {"q": "2025-Q3", "n": 25245, "eg": 12375}, {"q": "2025-Q4", "n": 21434, "eg": 10885}, {"q": "2026-Q1", "n": 34256, "eg": 15636}, {"q": "2026-Q2", "n": 41575, "eg": 17993}, {"q": "2026-Q3", "n": 28728, "eg": 12140}], "verdict": [{"yr": "2024", "n": 248193, "ec": 3415, "eg": 70926}, {"yr": "2025", "n": 114854, "ec": 727, "eg": 31268}, {"yr": "2026", "n": 171948, "ec": 1692, "eg": 45682}], "postcutoff": [{"series": "1862", "label": "Consumer Safety Inspection", "dept": "AG", "n": 106}, {"series": "1811", "label": "Criminal Investigation", "dept": "DJ", "n": 98}, {"series": "1811", "label": "Criminal Investigation", "dept": "HS", "n": 43}, {"series": "1811", "label": "Criminal Investigation", "dept": "PO", "n": 36}, {"series": "1811", "label": "Criminal Investigation", "dept": "IN", "n": 22}, {"series": "0962", "label": "Contact Representative", "dept": "DD", "n": 21}, {"series": "1811", "label": "Criminal Investigation", "dept": "VA", "n": 20}, {"series": "0962", "label": "Contact Representative", "dept": "VA", "n": 17}, {"series": "0962", "label": "Contact Representative", "dept": "TR", "n": 16}, {"series": "1811", "label": "Criminal Investigation", "dept": "CM", "n": 16}, {"series": "1811", "label": "Criminal Investigation", "dept": "TR", "n": 16}, {"series": "1811", "label": "Criminal Investigation", "dept": "SB", "n": 14}, {"series": "1340", "label": "Meteorology", "dept": "CM", "n": 13}, {"series": "0962", "label": "Contact Representative", "dept": "IN", "n": 11}, {"series": "1811", "label": "Criminal Investigation", "dept": "AG", "n": 11}], "postcutoff_total": 586, "drift_top": [{"s": "0099", "n24": 175, "n26": 93, "g24": 3.19, "g26": 0.57, "d": -2.62}, {"s": "0601", "n24": 2300, "n26": 916, "g24": 11.86, "g26": 10.92, "d": -0.94}, {"s": "0858", "n24": 186, "n26": 103, "g24": 11.08, "g26": 10.2, "d": -0.88}, {"s": "0901", "n24": 648, "n26": 525, "g24": 9.54, "g26": 8.77, "d": -0.77}, {"s": "0962", "n24": 614, "n26": 202, "g24": 7.16, "g26": 6.42, "d": -0.74}, {"s": "0181", "n24": 126, "n26": 81, "g24": 7.48, "g26": 6.88, "d": -0.6}, {"s": "0861", "n24": 300, "n26": 99, "g24": 13.16, "g26": 12.57, "d": -0.59}, {"s": "2010", "n24": 965, "n26": 505, "g24": 9.47, "g26": 8.89, "d": -0.58}, {"s": "0950", "n24": 967, "n26": 651, "g24": 10.19, "g26": 9.63, "d": -0.56}, {"s": "1712", "n24": 1919, "n26": 742, "g24": 10.64, "g26": 10.09, "d": -0.55}, {"s": "1550", "n24": 299, "n26": 101, "g24": 12.45, "g26": 11.94, "d": -0.51}, {"s": "0028", "n24": 1086, "n26": 337, "g24": 11.6, "g26": 11.15, "d": -0.45}], "drift_median": 0.1, "drift_down_share": 35.6, "agencies": [{"dept": "DOD", "n24": 118416, "n26": 73972, "pct": -37.5}, {"dept": "VA", "n24": 41084, "n26": 51389, "pct": 25.1}, {"dept": "DJ", "n24": 7990, "n26": 9080, "pct": 13.6}, {"dept": "HS", "n24": 13648, "n26": 8109, "pct": -40.6}, {"dept": "IN", "n24": 10828, "n26": 4459, "pct": -58.8}, {"dept": "TD", "n24": 4716, "n26": 3591, "pct": -23.9}, {"dept": "AG", "n24": 8224, "n26": 3023, "pct": -63.2}, {"dept": "HE", "n24": 8541, "n26": 2629, "pct": -69.2}, {"dept": "TR", "n24": 7600, "n26": 1547, "pct": -79.6}, {"dept": "CM", "n24": 3615, "n26": 1515, "pct": -58.1}, {"dept": "DN", "n24": 2514, "n26": 1357, "pct": -46.0}, {"dept": "ST", "n24": 1340, "n26": 872, "pct": -34.9}, {"dept": "DL", "n24": 1283, "n26": 807, "pct": -37.1}, {"dept": "NN", "n24": 1122, "n26": 728, "pct": -35.1}, {"dept": "OM", "n24": 720, "n26": 655, "pct": -9.0}, {"dept": "SM", "n24": 761, "n26": 604, "pct": -20.6}, {"dept": "HU", "n24": 1287, "n26": 592, "pct": -54.0}, {"dept": "OI", "n24": 1353, "n26": 510, "pct": -62.3}], "coverage": {"min": "2024-01-01", "max": "2026-09-01", "n": 706608, "built": "2026-09-01"}};
+const D = __DATA__;
 const fmt = n => n.toLocaleString();
 const INK='#1c1b1a', BLUE='#0f4c81', RUST='#b3552d', MUT='#6e6a64';
 
@@ -264,3 +454,7 @@ document.getElementById('foot').innerHTML =
 </script>
 </body>
 </html>
+"""
+
+if __name__ == "__main__":
+    main()
